@@ -8,7 +8,9 @@ import 'package:flutter/material.dart';
 import 'package:maplibre_gl/maplibre_gl.dart';
 
 import '../models/location_suggestion.dart';
+import '../services/connectivity_service.dart';
 import '../services/location_service.dart';
+import '../services/offline_map_service.dart';
 
 class LocationPicker extends StatefulWidget {
   final Function(double latitude, double longitude, String address, String method)
@@ -53,6 +55,13 @@ class _LocationPickerState extends State<LocationPicker> {
   
   // Track symbols to avoid clearing issues
   final Map<int, Symbol> _controllerSymbols = {};
+  final ValueNotifier<ConnectivityStatus> _connectivityNotifier =
+      ConnectivityService.instance.statusNotifier;
+  late final VoidCallback _connectivityListener;
+  String? _offlineStyleOverride;
+  String? _offlineRegionId;
+  String? _offlineRegionName;
+  bool _isApplyingOfflineStyle = false;
 
   @override
   void initState() {
@@ -84,6 +93,25 @@ class _LocationPickerState extends State<LocationPicker> {
         });
       }
     });
+
+    _connectivityListener = () {
+      final status = _connectivityNotifier.value;
+      if (status == ConnectivityStatus.offline) {
+        _maybeUpdateOfflineStyle();
+      } else {
+        setState(() {
+          _offlineStyleOverride = null;
+          _offlineRegionId = null;
+        });
+        _controllersWithMarkerImage.clear();
+        _controllerSymbols.clear();
+      }
+    };
+    _connectivityNotifier.addListener(_connectivityListener);
+
+    if (_connectivityNotifier.value == ConnectivityStatus.offline) {
+      _maybeUpdateOfflineStyle();
+    }
   }
 
   @override
@@ -92,6 +120,7 @@ class _LocationPickerState extends State<LocationPicker> {
     _addressBlurTimer?.cancel();
     _addressFocusNode.dispose();
     _addressController.dispose();
+    _connectivityNotifier.removeListener(_connectivityListener);
     super.dispose();
   }
 
@@ -176,6 +205,7 @@ class _LocationPickerState extends State<LocationPicker> {
     MapLibreMapController? controller,
     bool animate = false,
     double zoom = 16,
+    bool skipOfflineUpdate = false,
   }) async {
     final target = controller ?? _mapController;
     if (target == null) {
@@ -203,11 +233,20 @@ class _LocationPickerState extends State<LocationPicker> {
           iconAnchor: 'bottom',
         ),
       );
-      
+
       // Track the symbol for this controller
       _controllerSymbols[target.hashCode] = symbol;
     } catch (e) {
       print('Error adding symbol: $e');
+    }
+
+    if (!skipOfflineUpdate &&
+        _connectivityNotifier.value == ConnectivityStatus.offline) {
+      unawaited(
+        _maybeUpdateOfflineStyle(
+          focus: LatLng(latitude, longitude),
+        ),
+      );
     }
   }
 
@@ -331,6 +370,9 @@ class _LocationPickerState extends State<LocationPicker> {
           animate: true,
         );
       }
+      if (_connectivityNotifier.value == ConnectivityStatus.offline) {
+        await _maybeUpdateOfflineStyle();
+      }
     }();
   }
 
@@ -348,6 +390,9 @@ class _LocationPickerState extends State<LocationPicker> {
           controller: controller,
           animate: true,
         );
+      }
+      if (_connectivityNotifier.value == ConnectivityStatus.offline) {
+        await _maybeUpdateOfflineStyle();
       }
     }();
   }
@@ -390,6 +435,10 @@ class _LocationPickerState extends State<LocationPicker> {
         address,
         'pin',
       );
+
+      if (_connectivityNotifier.value == ConnectivityStatus.offline) {
+        await _maybeUpdateOfflineStyle(focus: coordinates);
+      }
 
       if (mounted) {
         _showSnackBar(
@@ -761,6 +810,100 @@ class _LocationPickerState extends State<LocationPicker> {
     _scaffoldContext = context;
   }
 
+  Future<void> _maybeUpdateOfflineStyle({LatLng? focus, bool? satelliteOverride}) async {
+    if (!mounted) {
+      return;
+    }
+    if (_connectivityNotifier.value != ConnectivityStatus.offline) {
+      return;
+    }
+    if (_isApplyingOfflineStyle) {
+      return;
+    }
+
+    final fallbackTarget = LatLng(
+      _currentLatitude ?? -21.1789,
+      _currentLongitude ?? -175.1982,
+    );
+    final target = focus ?? fallbackTarget;
+
+    _isApplyingOfflineStyle = true;
+    try {
+    var region = await OfflineMapService.instance.findRegionCovering(target);
+    String? styleJson;
+    String? regionId;
+    if (region == null) {
+      region = await OfflineMapService.instance.findNearestReadyRegion(target);
+    }
+    if (region != null) {
+      final useSatellite = satelliteOverride ?? _isSatelliteMode;
+      styleJson = await OfflineMapService.instance.resolveOfflineStyle(
+        region,
+        variant: useSatellite
+            ? OfflineMapVariant.satellite
+            : OfflineMapVariant.standard,
+      );
+      regionId = region.id;
+    }
+    styleJson ??= _buildOfflinePlaceholderStyle();
+
+    if (!mounted) {
+        return;
+    }
+
+    if (_offlineStyleOverride == styleJson && _offlineRegionId == regionId) {
+        return;
+    }
+
+      setState(() {
+        _offlineStyleOverride = styleJson;
+        _offlineRegionId = regionId;
+        _offlineRegionName = region?.name;
+        _controllersWithMarkerImage.clear();
+        _controllerSymbols.clear();
+      });
+
+      // If we selected a nearest region, recenter map inside it to reveal tiles.
+      if (region != null) {
+        final centerLat =
+            (region.bounds.southwest.latitude + region.bounds.northeast.latitude) / 2.0;
+        final centerLng =
+            (region.bounds.southwest.longitude + region.bounds.northeast.longitude) / 2.0;
+        final center = LatLng(centerLat, centerLng);
+        _currentLatitude = center.latitude;
+        _currentLongitude = center.longitude;
+        final controller = _mapController ?? _embeddedMapController;
+        if (controller != null) {
+          await controller.animateCamera(
+            CameraUpdate.newCameraPosition(
+              CameraPosition(target: center, zoom: 12.0),
+            ),
+          );
+        }
+      }
+    } finally {
+      _isApplyingOfflineStyle = false;
+    }
+  }
+
+  String _buildOfflinePlaceholderStyle() {
+    return '''
+{
+  "version": 8,
+  "sources": {},
+  "layers": [
+    {
+      "id": "background",
+      "type": "background",
+      "paint": {
+        "background-color": "#1F2937"
+      }
+    }
+  ]
+}
+''';
+  }
+
   void _toggleMapStyle() {
     setState(() {
       _isSatelliteMode = !_isSatelliteMode;
@@ -771,6 +914,11 @@ class _LocationPickerState extends State<LocationPicker> {
     if (mounted) {
       setState(() {});
     }
+
+    // If offline, re-resolve the offline style with the new variant.
+    if (_connectivityNotifier.value == ConnectivityStatus.offline) {
+      unawaited(_maybeUpdateOfflineStyle(satelliteOverride: _isSatelliteMode));
+    }
   }
 
   Widget _buildFullScreenMap(BuildContext fullScreenContext) {
@@ -779,7 +927,9 @@ class _LocationPickerState extends State<LocationPicker> {
         return Stack(
           children: [
             MapLibreMap(
-              key: ValueKey('fullscreen-${_isSatelliteMode ? 'satellite' : 'standard'}'),
+              key: ValueKey(
+                'fullscreen-${_isSatelliteMode ? 'satellite' : 'standard'}-${_offlineRegionId ?? (_offlineStyleOverride != null ? 'offline' : 'online')}',
+              ),
               onMapCreated: _onFullScreenMapCreated,
               onStyleLoadedCallback: _onFullScreenStyleLoaded,
               onMapClick: (point, coordinates) => _onMapClick(point, coordinates),
@@ -796,6 +946,30 @@ class _LocationPickerState extends State<LocationPicker> {
               zoomGesturesEnabled: true,
               doubleClickZoomEnabled: true,
             ),
+            if (_offlineRegionId != null && _offlineRegionName != null)
+              Positioned(
+                top: MediaQuery.of(fullScreenContext).padding.top + 16 + 48 + 12,
+                left: 16,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.7),
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.offline_pin, size: 16, color: Colors.white),
+                      const SizedBox(width: 6),
+                      Text(
+                        'Offline region: ${_offlineRegionName!}',
+                        style: const TextStyle(color: Colors.white, fontSize: 12),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
         // Right side button column
         Positioned(
           top: MediaQuery.of(fullScreenContext).padding.top + 16,
@@ -886,6 +1060,10 @@ class _LocationPickerState extends State<LocationPicker> {
                       _controllersWithMarkerImage.clear();
                     });
                     setFullScreenState(() {}); // Update full screen UI
+                    // If offline, re-apply offline style with the chosen variant
+                    if (_connectivityNotifier.value == ConnectivityStatus.offline) {
+                      unawaited(_maybeUpdateOfflineStyle(satelliteOverride: _isSatelliteMode));
+                    }
                   },
                   iconSize: 24,
                 ),
@@ -960,20 +1138,6 @@ class _LocationPickerState extends State<LocationPicker> {
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: [
-        Align(
-          alignment: Alignment.centerRight,
-          child: ElevatedButton.icon(
-            onPressed: _openFullScreen,
-            icon: const Icon(Icons.fullscreen),
-            label: const Text('Full Screen'),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.purple.shade600,
-              foregroundColor: Colors.white,
-            ),
-          ),
-        ),
-        const SizedBox(height: 12),
-
         Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -1068,7 +1232,9 @@ class _LocationPickerState extends State<LocationPicker> {
               child: Stack(
                 children: [
                   MapLibreMap(
-                    key: ValueKey('embedded-${_isSatelliteMode ? 'satellite' : 'standard'}'),
+                    key: ValueKey(
+                      'embedded-${_isSatelliteMode ? 'satellite' : 'standard'}-${_offlineRegionId ?? (_offlineStyleOverride != null ? 'offline' : 'online')}',
+                    ),
                     onMapCreated: _onEmbeddedMapCreated,
                     onStyleLoadedCallback: _onEmbeddedStyleLoaded,
                     onMapClick: (point, coordinates) => _onMapClick(point, coordinates),
@@ -1085,12 +1251,50 @@ class _LocationPickerState extends State<LocationPicker> {
                     zoomGesturesEnabled: true,
                     doubleClickZoomEnabled: true,
                   ),
+                  if (_offlineRegionId != null && _offlineRegionName != null)
+                    Positioned(
+                      top: 8,
+                      left: 8,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.7),
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(Icons.offline_pin, size: 16, color: Colors.white),
+                            const SizedBox(width: 6),
+                            Text(
+                              'Offline region: ${_offlineRegionName!}',
+                              style: const TextStyle(color: Colors.white, fontSize: 12),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
                   // Right side button column
                   Positioned(
                     top: 8,
                     right: 8,
                     child: Column(
                       children: [
+                        // Fullscreen button
+                        Container(
+                          decoration: BoxDecoration(
+                            color: Colors.purple.shade600,
+                            borderRadius: BorderRadius.circular(20),
+                          ),
+                          child: IconButton(
+                            tooltip: 'Open full screen map',
+                            icon: const Icon(Icons.fullscreen, color: Colors.white),
+                            onPressed: _openFullScreen,
+                            iconSize: 20,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
                         // Pin button
                         Container(
                           decoration: BoxDecoration(
@@ -1219,6 +1423,10 @@ class _LocationPickerState extends State<LocationPicker> {
   }
 
   String _getMapStyle({bool? satelliteOverride}) {
+    if (_connectivityNotifier.value == ConnectivityStatus.offline &&
+        _offlineStyleOverride != null) {
+      return _offlineStyleOverride!;
+    }
     final useSatellite = satelliteOverride ?? _isSatelliteMode;
     if (useSatellite) {
       return '''

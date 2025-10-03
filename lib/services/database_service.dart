@@ -20,8 +20,9 @@ class DatabaseService {
 
     return await openDatabase(
       path,
-      version: 1,
+      version: 2,
       onCreate: _createDB,
+      onUpgrade: _upgradeDB,
     );
   }
 
@@ -42,6 +43,50 @@ class DatabaseService {
         created_at TEXT NOT NULL
       )
     ''');
+
+    await db.execute('''
+      CREATE TABLE offline_regions(
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        style_url TEXT NOT NULL,
+        min_zoom REAL NOT NULL,
+        max_zoom REAL NOT NULL,
+        north REAL NOT NULL,
+        south REAL NOT NULL,
+        east REAL NOT NULL,
+        west REAL NOT NULL,
+        status TEXT NOT NULL,
+        tile_count INTEGER DEFAULT 0,
+        size_bytes INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_error TEXT
+      )
+    ''');
+  }
+
+  Future _upgradeDB(Database db, int oldVersion, int newVersion) async {
+    if (oldVersion < 2) {
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS offline_regions(
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          style_url TEXT NOT NULL,
+          min_zoom REAL NOT NULL,
+          max_zoom REAL NOT NULL,
+          north REAL NOT NULL,
+          south REAL NOT NULL,
+          east REAL NOT NULL,
+          west REAL NOT NULL,
+          status TEXT NOT NULL,
+          tile_count INTEGER DEFAULT 0,
+          size_bytes INTEGER DEFAULT 0,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          last_error TEXT
+        )
+      ''');
+    }
   }
 
   Future<int> insertRecord(DataRecord record) async {
@@ -83,6 +128,45 @@ class DatabaseService {
     final db = await database;
     return await db.delete(
       'data_records',
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
+  Future<void> upsertOfflineRegion(Map<String, dynamic> data) async {
+    final db = await database;
+    await db.insert(
+      'offline_regions',
+      data,
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<List<Map<String, dynamic>>> getOfflineRegionsRaw() async {
+    final db = await database;
+    return db.query(
+      'offline_regions',
+      orderBy: 'created_at DESC',
+    );
+  }
+
+  Future<void> deleteOfflineRegion(String id) async {
+    final db = await database;
+    await db.delete(
+      'offline_regions',
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
+  Future<void> updateOfflineRegionStatus(
+    String id,
+    Map<String, dynamic> patch,
+  ) async {
+    final db = await database;
+    await db.update(
+      'offline_regions',
+      patch,
       where: 'id = ?',
       whereArgs: [id],
     );
